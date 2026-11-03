@@ -126,9 +126,13 @@ sc_taildrop_spawn() {
 
 sc_taildrop_running() {
     [ -n "${sc_taildrop_pid:-}" ] && [ -n "${sc_taildrop_start:-}" ] || return 1
-    [ "$(sc_start_time "$sc_taildrop_pid")" = "$sc_taildrop_start" ] || return 1
+    sc_read_stat "$sc_taildrop_pid" && [ "$sc_proc_start" = "$sc_taildrop_start" ] &&
+        [ "$sc_proc_state" != Z ] || return 1
+    # The command line of this identity was already verified (see sc_daemon_running).
+    [ "${sc_taildrop_verified:-}" = "$sc_taildrop_pid.$sc_taildrop_start" ] && return 0
     sc_cmdline=$(tr '\000' ' ' < "/proc/$sc_taildrop_pid/cmdline" 2>/dev/null) || return 1
-    [ "${sc_cmdline% }" = "$SC_MODDIR/bin/shellscaled-web taildrop-auto" ]
+    [ "${sc_cmdline% }" = "$SC_MODDIR/bin/shellscaled-web taildrop-auto" ] || return 1
+    sc_taildrop_verified="$sc_taildrop_pid.$sc_taildrop_start"
 }
 
 sc_supervise_cleanup() {
@@ -163,7 +167,7 @@ sc_supervise() {
     sc_log 'Supervisor started.'
     sc_taildrop_spawn
     sc_failures=0
-    sc_description_tick=0
+    sc_maintenance_tick=0
     sc_magicdns_daemon_identity=
     # Keep a proxy that sc_start adopted together with its daemon.
     if sc_magicdns_running && sc_daemon_running; then
@@ -195,12 +199,14 @@ sc_supervise() {
             fi
             sleep 5
         fi
-        sc_bound_logs
         sc_taildrop_running || sc_taildrop_spawn
-        if [ "$sc_description_tick" -eq 0 ]; then
+        # Log trimming and the description refresh fork and exec, so they run
+        # once a minute. RPC actions refresh the description immediately.
+        if [ "$sc_maintenance_tick" -eq 0 ]; then
+            sc_bound_logs
             sc_refresh_description
         fi
-        sc_description_tick=$(((sc_description_tick + 1) % 5))
+        sc_maintenance_tick=$(((sc_maintenance_tick + 1) % 20))
         sleep 3
     done
 }
