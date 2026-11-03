@@ -12,6 +12,8 @@ SC_SUPERVISOR_PID=$SC_RUN/supervisor.pid
 SC_STOP=$SC_RUN/stop
 SC_LOCK=$SC_RUN/control.lock
 SC_LOCK_OWNER=
+sc_daemon_verified=
+sc_magicdns_verified=
 SC_DAEMON_ARGS="--tun=tailscale0 --state=$SC_STATE/tailscaled.state --statedir=$SC_STATE --socket=$SC_SOCKET --no-logs-no-support"
 
 sc_error() {
@@ -51,11 +53,25 @@ sc_refresh_description() {
 
 # Field 22 is the kernel process start time. Removing '(comm)' first also
 # handles spaces in the process name without matching unrelated processes.
-sc_start_time() {
+# Sets sc_proc_state and sc_proc_start using builtins only: the supervisor
+# checks its children every few seconds, and each fork/exec costs CPU time.
+sc_read_stat() {
+    sc_proc_state=
+    sc_proc_start=
     [ -r "/proc/$1/stat" ] || return 1
-    sc_stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+    { read -r sc_stat < "/proc/$1/stat"; } 2>/dev/null || return 1
     sc_stat=${sc_stat##*) }
-    printf '%s\n' "$sc_stat" | cut -d ' ' -f 20
+    # The remaining fields are numbers and the one-letter state.
+    # shellcheck disable=SC2086
+    set -- $sc_stat
+    sc_proc_state=$1
+    sc_proc_start=${20}
+    [ -n "$sc_proc_start" ]
+}
+
+sc_start_time() {
+    sc_read_stat "$1" || return 1
+    printf '%s\n' "$sc_proc_start"
 }
 
 sc_record_pid() {
@@ -74,15 +90,24 @@ sc_read_pid() {
     case "$SC_PID:$SC_PID_START" in *[!0-9:]*|:*|*:) return 1 ;; esac
     [ -z "$sc_pid_extra" ] && [ "$SC_PID" -gt 1 ] || return 1
     kill -0 "$SC_PID" 2>/dev/null || return 1
-    [ "$(sc_start_time "$SC_PID")" = "$SC_PID_START" ]
+    # A zombie keeps its PID and start time but is no longer running.
+    sc_read_stat "$SC_PID" && [ "$sc_proc_start" = "$SC_PID_START" ] && [ "$sc_proc_state" != Z ]
 }
 
+# A verified PID and start time keep their executable unless the process execs
+# again, which tailscaled and the helper never do; the result is cached for that
+# identity. The process is spawned by a forked shell, so the cache is filled only
+# once readlink sees the real binary.
 sc_daemon_running() {
     sc_read_pid "$SC_DAEMON_PID" || return 1
+    [ "$sc_daemon_verified" = "$SC_PID.$SC_PID_START" ] && return 0
     sc_exe=$(readlink "/proc/$SC_PID/exe" 2>/dev/null) || return 1
     # A live update renames the old tree into $SC_DATA/trash (docs/hot-update.md).
     case "${sc_exe%" (deleted)"}" in
-        "$SC_MODDIR/bin/tailscaled"|"$SC_DATA"/trash/*/bin/tailscaled) return 0 ;;
+        "$SC_MODDIR/bin/tailscaled"|"$SC_DATA"/trash/*/bin/tailscaled)
+            sc_daemon_verified="$SC_PID.$SC_PID_START"
+            return 0
+            ;;
     esac
     return 1
 }
@@ -209,11 +234,16 @@ sc_stop_daemon() {
     rm -f "$SC_DAEMON_PID" "$SC_SOCKET"
 }
 
+# Cached per PID and start time like sc_daemon_running.
 sc_magicdns_running() {
     sc_read_pid "$SC_MAGICDNS_PID" || return 1
+    [ "$sc_magicdns_verified" = "$SC_PID.$SC_PID_START" ] && return 0
     sc_magicdns_exe=$(readlink "/proc/$SC_PID/exe" 2>/dev/null) || return 1
     case "${sc_magicdns_exe%" (deleted)"}" in
-        "$SC_MODDIR/bin/shellscaled-web"|"$SC_DATA"/trash/*/bin/shellscaled-web) return 0 ;;
+        "$SC_MODDIR/bin/shellscaled-web"|"$SC_DATA"/trash/*/bin/shellscaled-web)
+            sc_magicdns_verified="$SC_PID.$SC_PID_START"
+            return 0
+            ;;
     esac
     return 1
 }
