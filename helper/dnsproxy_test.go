@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -31,8 +32,11 @@ func testQuery(id uint16, name string, qtype uint16) []byte {
 func dnsTestProxy(t *testing.T, handler func(*http.Request) (int, string)) (*magicDNSProxy, *int) {
 	t.Helper()
 	calls := 0
+	var mu sync.Mutex
 	b := &backend{client: &http.Client{Transport: transportFunc(func(r *http.Request) (*http.Response, error) {
+		mu.Lock()
 		calls++
+		mu.Unlock()
 		code, body := handler(r)
 		return &http.Response{StatusCode: code, Body: io.NopCloser(strings.NewReader(body)), Header: http.Header{}}, nil
 	})}}
@@ -795,5 +799,545 @@ func TestSameHelperExe(t *testing.T) {
 		if got := sameHelperExe(self, exe); got != want {
 			t.Errorf("sameHelperExe(%q) = %v, want %v", exe, got, want)
 		}
+	}
+}
+
+func testIPv6UDPPacket(src, dst netip.AddrPort, payload []byte) []byte {
+	pkt := make([]byte, 48+len(payload))
+	pkt[0] = 0x60
+	binary.BigEndian.PutUint16(pkt[4:6], uint16(8+len(payload)))
+	pkt[6] = syscall.IPPROTO_UDP
+	pkt[7] = 64
+	copy(pkt[8:24], src.Addr().AsSlice())
+	copy(pkt[24:40], dst.Addr().AsSlice())
+	binary.BigEndian.PutUint16(pkt[40:42], src.Port())
+	binary.BigEndian.PutUint16(pkt[42:44], dst.Port())
+	binary.BigEndian.PutUint16(pkt[44:46], uint16(8+len(payload)))
+	copy(pkt[48:], payload)
+	return pkt
+}
+
+func testNFQPacketMsg(queue uint16, packetID, mark, outdev uint32, ipPayload []byte) []byte {
+	hdr := make([]byte, 7)
+	binary.BigEndian.PutUint32(hdr[0:4], packetID)
+	binary.BigEndian.PutUint16(hdr[4:6], 0x86dd)
+	var attrs [][]byte
+	attrs = append(attrs, nlAttr(nfqaPacketHdr, hdr))
+	if mark != 0 {
+		attrs = append(attrs, nlAttr(nfqaMark, binary.BigEndian.AppendUint32(nil, mark)))
+	}
+	if outdev != 0 {
+		attrs = append(attrs, nlAttr(nfqaIfindexOutdev, binary.BigEndian.AppendUint32(nil, outdev)))
+	}
+	attrs = append(attrs, nlAttr(nfqaPayload, ipPayload))
+	return nfqMsg(nfqnlMsgPacket, 0, 0, syscall.AF_INET6, queue, attrs...)
+}
+
+func TestDesiredNFQueueRules(t *testing.T) {
+	if got := desiredNFQueueRules("off", []string{"tail1234.ts.net"}); len(got) != 0 {
+		t.Fatalf("off mode must not install rules: %v", got)
+	}
+	if got := desiredNFQueueRules("tailnet", nil); len(got) != 0 {
+		t.Fatalf("tailnet without suffixes must not install rules: %v", got)
+	}
+	rules := desiredNFQueueRules("tailnet", []string{"tail1234.ts.net", "corp.example"})
+	if len(rules) != 3 || strings.Join(rules[0], " ") != markReturn {
+		t.Fatalf("unexpected tailnet nfqueue rules: %v", rules)
+	}
+	for _, r := range rules[1:] {
+		joined := strings.Join(r, " ")
+		if strings.Contains(joined, "CONNMARK") {
+			t.Fatalf("nfqueue rule must not use CONNMARK: %q", joined)
+		}
+		for _, want := range []string{"-m string --algo bm --icase --from 60 --to 320", "-p udp -j NFQUEUE --queue-num 1053 --queue-bypass"} {
+			if !strings.Contains(joined, want) {
+				t.Fatalf("rule %q lacks %q", joined, want)
+			}
+		}
+	}
+	for _, mode := range []string{"exit-doh", "exit-passthrough"} {
+		rules = desiredNFQueueRules(mode, nil)
+		if len(rules) != 2 || strings.Join(rules[0], " ") != markReturn ||
+			strings.Join(rules[1], " ") != "-p udp -j NFQUEUE --queue-num 1053 --queue-bypass" {
+			t.Fatalf("%s nfqueue rules: %v", mode, rules)
+		}
+	}
+}
+
+func TestRefreshIPv6NFQueueMode(t *testing.T) {
+	p, _ := dnsTestProxy(t, func(r *http.Request) (int, string) {
+		switch r.URL.Path + "?" + r.URL.RawQuery {
+		case "/localapi/v0/status?peers=false":
+			return 200, `{"BackendState":"Running","CurrentTailnet":{"MagicDNSSuffix":"tail1234.ts.net"},"ExitNodeStatus":{"ID":"nExit"}}`
+		case "/localapi/v0/prefs?":
+			return 200, `{"ExitNodeID":"nExit"}`
+		}
+		return 404, ""
+	})
+	p.ipv6Mode = ipv6ModeNFQueue
+	// IPv4 conntrack failing must not disable exit-passthrough when IPv6 NFQUEUE is active.
+	p.ctProbe = func(family int) error {
+		if family == 1 {
+			t.Error("NFQUEUE mode must not probe IPv6 conntrack")
+		}
+		return syscall.EOPNOTSUPP
+	}
+	var v4Rules, v6Rules, flushes []string
+	p.run = func(_ context.Context, name string, args ...string) ([]byte, error) {
+		if strings.HasSuffix(name, "iptables") && len(args) > 4 {
+			if args[2] != "nat" || args[4] != magicDNSChain {
+				t.Errorf("unexpected v4 command: %v", args)
+			}
+			if args[3] == "-A" {
+				v4Rules = append(v4Rules, strings.Join(args[5:], " "))
+			}
+		}
+		if strings.HasSuffix(name, "ip6tables") && len(args) > 4 {
+			if args[3] == "-F" {
+				flushes = append(flushes, args[2]+":"+args[4])
+			}
+			if args[3] == "-A" {
+				if args[2] != "filter" || args[4] != magicDNSChain {
+					t.Fatalf("unexpected v6 nfqueue target: %v", args)
+				}
+				v6Rules = append(v6Rules, strings.Join(args[5:], " "))
+			}
+		}
+		return nil, nil
+	}
+	p.refresh(context.Background())
+	if p.mode != "exit-passthrough" || len(v4Rules) != 3 || !strings.Contains(v4Rules[2], "-m string") {
+		t.Fatalf("v4 must narrow while mode stays exit-passthrough: mode=%s v4=%q", p.mode, v4Rules)
+	}
+	if len(v6Rules) != 2 || v6Rules[0] != markReturn || v6Rules[1] != "-p udp -j NFQUEUE --queue-num 1053 --queue-bypass" {
+		t.Fatalf("unexpected v6 nfqueue rules: %q", v6Rules)
+	}
+	state := readMagicDNSState(p.state, time.Now())
+	if state == nil || !state.Rules || !state.Rules6 || state.IPv6Fallback || state.Mode != "exit-passthrough" {
+		t.Fatalf("unexpected nfqueue state: %+v", state)
+	}
+	// Stopping the NFQUEUE listener flushes filter/shellscaled_dns and sets rules6=false.
+	flushes = nil
+	p.dead6.Store(true)
+	p.refresh(context.Background())
+	if p.listen6 || p.rulesOK[1] || len(flushes) != 1 || flushes[0] != "filter:"+magicDNSChain {
+		t.Fatalf("dead nfqueue listener cleanup failed: listen6=%v ok=%v flushes=%q", p.listen6, p.rulesOK, flushes)
+	}
+	if state := readMagicDNSState(p.state, time.Now()); state == nil || state.Rules6 {
+		t.Fatalf("expected rules6=false after dead nfqueue listener, got %+v", state)
+	}
+	// flushRules must flush all module IPv4 and IPv6 chains across tiers.
+	flushes = nil
+	var v4Flushed bool
+	origRun := p.run
+	p.run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if strings.HasSuffix(name, "/iptables") && len(args) > 4 && args[3] == "-F" {
+			v4Flushed = true
+		}
+		return origRun(ctx, name, args...)
+	}
+	p.flushRules()
+	if !v4Flushed || strings.Join(flushes, ",") != "nat:shellscaled_dns,filter:shellscaled_dns,filter:shellscaled_dns6_fallback" {
+		t.Fatalf("flushRules did not clear every tier: v4=%v v6=%q", v4Flushed, flushes)
+	}
+}
+
+func TestProbeIPv6Tiers(t *testing.T) {
+	t.Run("tier1-nat", func(t *testing.T) {
+		p, _ := dnsTestProxy(t, func(*http.Request) (int, string) { return 500, "" })
+		p.openNFQ = func(uint16) (*nfqConn, error) { t.Fatal("tier1 must not open nfqueue"); return nil, nil }
+		conn6, nfq := p.probeIPv6(context.Background())
+		if conn6 != nil {
+			defer conn6.Close()
+		}
+		if nfq != nil || p.v6Mode() != ipv6ModeNAT || p.ipv6Fallback {
+			t.Fatalf("tier1 got mode=%d fallback=%v nfq=%v", p.v6Mode(), p.ipv6Fallback, nfq)
+		}
+	})
+	t.Run("tier2-nfqueue", func(t *testing.T) {
+		p, _ := dnsTestProxy(t, func(*http.Request) (int, string) { return 500, "" })
+		p.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+			if args[2] == "nat" {
+				return nil, errors.New("no nat")
+			}
+			return nil, nil
+		}
+		p.probeTProxy6 = func() error { return nil }
+		fakeNFQ := &nfqConn{queue: magicDNSPort, close: func() error { return nil }}
+		p.openNFQ = func(q uint16) (*nfqConn, error) {
+			if q != magicDNSPort {
+				t.Fatalf("unexpected queue %d", q)
+			}
+			return fakeNFQ, nil
+		}
+		conn6, nfq := p.probeIPv6(context.Background())
+		if conn6 != nil || nfq != fakeNFQ || p.v6Mode() != ipv6ModeNFQueue || p.ipv6Fallback || !p.listen6 {
+			t.Fatalf("tier2 got mode=%d fallback=%v listen6=%v nfq=%v", p.v6Mode(), p.ipv6Fallback, p.listen6, nfq)
+		}
+	})
+	for _, tc := range []struct {
+		name      string
+		filterErr error
+		tproxyErr error
+		nfqErr    error
+	}{
+		{"missing-filter-chain", errors.New("no chain"), nil, nil},
+		{"missing-transparent", nil, syscall.ENOPROTOOPT, nil},
+		{"missing-nfqueue", nil, nil, syscall.EPROTONOSUPPORT},
+	} {
+		t.Run("tier3-fallback-"+tc.name, func(t *testing.T) {
+			p, _ := dnsTestProxy(t, func(*http.Request) (int, string) { return 500, "" })
+			p.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+				if args[2] == "nat" {
+					return nil, errors.New("no nat")
+				}
+				return nil, tc.filterErr
+			}
+			p.probeTProxy6 = func() error { return tc.tproxyErr }
+			p.openNFQ = func(uint16) (*nfqConn, error) { return nil, tc.nfqErr }
+			conn6, nfq := p.probeIPv6(context.Background())
+			if conn6 != nil || nfq != nil || p.v6Mode() != ipv6ModeFallback || !p.ipv6Fallback || p.listen6 {
+				t.Fatalf("tier3 got mode=%d fallback=%v listen6=%v", p.v6Mode(), p.ipv6Fallback, p.listen6)
+			}
+		})
+	}
+}
+
+func TestNFQueueEncodingAndParsing(t *testing.T) {
+	vMsg := nfqVerdictMsg(1053, 0x12345678, nfDrop)
+	if len(vMsg) < 32 || binary.NativeEndian.Uint32(vMsg[:4]) != uint32(len(vMsg)) ||
+		binary.NativeEndian.Uint16(vMsg[4:6]) != nfnlSubsysQueue<<8|nfqnlMsgVerdict ||
+		vMsg[16] != syscall.AF_UNSPEC || binary.BigEndian.Uint16(vMsg[18:20]) != 1053 {
+		t.Fatalf("unexpected verdict header %x", vMsg)
+	}
+	vAttr := nlFind(vMsg[20:], nfqaVerdictHdr)
+	if len(vAttr) != 8 || binary.BigEndian.Uint32(vAttr[:4]) != nfDrop || binary.BigEndian.Uint32(vAttr[4:8]) != 0x12345678 {
+		t.Fatalf("unexpected verdict attr %x", vAttr)
+	}
+
+	src := netip.MustParseAddrPort("[2001:db8::10]:45678")
+	dst := netip.MustParseAddrPort("[2001:4860:4860::8888]:53")
+	q := testQuery(0x2233, "host.tail1234.ts.net", 28)
+	raw := testNFQPacketMsg(1053, 42, 0x300a9, 27, testIPv6UDPPacket(src, dst, q))
+	pkt, ok := parseNFQPacket(raw[20:])
+	if !ok || pkt.id != 42 || pkt.mark != 0x300a9 || pkt.outdev != 27 {
+		t.Fatalf("parsed nfq packet: ok=%v %+v", ok, pkt)
+	}
+	dnsPkt, gotSrc, gotDst, ok := parseIPv6UDPDNS(pkt.payload)
+	if !ok || gotSrc != src || gotDst != dst || string(dnsPkt) != string(q) {
+		t.Fatalf("parsed ipv6 udp: ok=%v src=%v dst=%v len=%d", ok, gotSrc, gotDst, len(dnsPkt))
+	}
+
+	extHdr := testIPv6UDPPacket(src, dst, q)
+	extHdr[6] = 0 // Hop-by-Hop extension header, not direct UDP
+	v4Mapped := testIPv6UDPPacket(src, netip.MustParseAddrPort("[::ffff:8.8.8.8]:53"), q)
+	shortIP := testIPv6UDPPacket(src, dst, q)
+	binary.BigEndian.PutUint16(shortIP[4:6], 100)
+	badUDP := testIPv6UDPPacket(src, dst, q)
+	binary.BigEndian.PutUint16(badUDP[44:46], 4)
+	for _, bad := range [][]byte{nil, extHdr[:47], extHdr, v4Mapped, shortIP, badUDP} {
+		if _, _, _, ok := parseIPv6UDPDNS(bad); ok {
+			t.Fatalf("accepted invalid payload len=%d", len(bad))
+		}
+	}
+}
+
+func TestServeNFQueueRoutingAndPassthrough(t *testing.T) {
+	upstream, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback})
+	if err != nil {
+		t.Skip("no IPv6 loopback:", err)
+	}
+	defer upstream.Close()
+	go func() {
+		buf := make([]byte, 512)
+		for {
+			n, addr, err := upstream.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			_, _ = upstream.WriteToUDP(reply(buf[:n], n, 3), addr)
+		}
+	}()
+	upstreamPort := uint16(upstream.LocalAddr().(*net.UDPAddr).Port)
+
+	p, _ := dnsTestProxy(t, func(r *http.Request) (int, string) {
+		if r.URL.Path == "/localapi/v0/dns-query" {
+			body, _ := json.Marshal(struct{ Bytes []byte }{reply(testQuery(1, "host.tail1234.ts.net", 28), 12, 0)})
+			return 200, string(body)
+		}
+		return 404, ""
+	})
+	p.ipv6Mode = ipv6ModeNFQueue
+	p.suffix = "tail1234.ts.net"
+	p.mode = "exit-passthrough"
+	p.ifName = func(idx int) string {
+		if idx == 27 {
+			return "wlan1"
+		}
+		return ""
+	}
+
+	type verdictRecord struct {
+		id, verdict uint32
+	}
+	type replyRecord struct {
+		origDst, client netip.AddrPort
+		outdev          uint32
+		resp            []byte
+	}
+	inCh := make(chan []byte, 16)
+	verdictCh := make(chan verdictRecord, 16)
+	replyCh := make(chan replyRecord, 16)
+	closedCh := make(chan struct{})
+	var closeOnce sync.Once
+	q := &nfqConn{
+		queue: magicDNSPort,
+		read: func(buf []byte) (int, error) {
+			select {
+			case msg := <-inCh:
+				n := copy(buf, msg)
+				return n, nil
+			case <-closedCh:
+				return 0, net.ErrClosed
+			}
+		},
+		write: func(b []byte) (int, error) {
+			if len(b) >= 20 && binary.NativeEndian.Uint16(b[4:6]) == nfnlSubsysQueue<<8|nfqnlMsgVerdict {
+				v := nlFind(b[20:], nfqaVerdictHdr)
+				if len(v) == 8 {
+					verdictCh <- verdictRecord{binary.BigEndian.Uint32(v[4:8]), binary.BigEndian.Uint32(v[:4])}
+				}
+			}
+			return len(b), nil
+		},
+		close: func() error {
+			closeOnce.Do(func() { close(closedCh) })
+			return nil
+		},
+	}
+	p.reply6 = func(origDst, client netip.AddrPort, outdev uint32, resp []byte) error {
+		replyCh <- replyRecord{origDst, client, outdev, append([]byte(nil), resp...)}
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	slots := make(chan struct{}, 64)
+	done := make(chan error, 1)
+	go func() { done <- p.serveNFQueue(ctx, q, slots) }()
+
+	client := netip.MustParseAddrPort("[2001:db8::5]:45000")
+	guaDNS := netip.MustParseAddrPort("[2001:4860:4860::8888]:53")
+	loopUpstream := netip.AddrPortFrom(netip.IPv6Loopback(), upstreamPort)
+	llDNS := netip.MustParseAddrPort("[fe80::1]:53")
+	llClient := netip.MustParseAddrPort("[fe80::2]:45001")
+
+	// 1. Tailnet query to GUA DNS -> NF_DROP + LocalAPI answer.
+	inCh <- testNFQPacketMsg(1053, 1, 0x300a9, 27, testIPv6UDPPacket(client, guaDNS, testQuery(0x1111, "host.tail1234.ts.net", 28)))
+	// 2. Passthrough query to loopback upstream -> NF_DROP + UDP6 passthrough answer.
+	inCh <- testNFQPacketMsg(1053, 2, 0x300a9, 27, testIPv6UDPPacket(client, loopUpstream, testQuery(0x2222, "www.example.com", 28)))
+	// 3. Bypass-marked query -> NF_ACCEPT without reply.
+	inCh <- testNFQPacketMsg(1053, 3, 0x100200a9, 27, testIPv6UDPPacket(client, guaDNS, testQuery(0x3333, "www.example.com", 28)))
+	// 4. Link-local query without outdev -> NF_ACCEPT without reply.
+	inCh <- testNFQPacketMsg(1053, 4, 0x300a9, 0, testIPv6UDPPacket(llClient, llDNS, testQuery(0x4444, "host.tail1234.ts.net", 28)))
+	// 5. Link-local query with outdev=27 -> NF_DROP + LocalAPI answer + outdev preserved for reply6.
+	inCh <- testNFQPacketMsg(1053, 5, 0x300a9, 27, testIPv6UDPPacket(llClient, llDNS, testQuery(0x5555, "host.tail1234.ts.net", 28)))
+	// 6. Loopback :1053 destination -> NF_ACCEPT.
+	inCh <- testNFQPacketMsg(1053, 6, 0, 1, testIPv6UDPPacket(client, netip.MustParseAddrPort("[::1]:1053"), testQuery(0x6666, "www.example.com", 1)))
+	// 7. Short non-DNS payload -> NF_ACCEPT.
+	inCh <- testNFQPacketMsg(1053, 7, 0, 27, testIPv6UDPPacket(client, guaDNS, []byte{1, 2, 3}))
+
+	wantVerdicts := map[uint32]uint32{
+		1: nfDrop, 2: nfDrop, 3: nfAccept, 4: nfAccept, 5: nfDrop, 6: nfAccept, 7: nfAccept,
+	}
+	for total := len(wantVerdicts); total > 0; total-- {
+		v := <-verdictCh
+		if want, ok := wantVerdicts[v.id]; !ok || v.verdict != want {
+			t.Fatalf("packet %d got verdict %d, want %d", v.id, v.verdict, want)
+		}
+		delete(wantVerdicts, v.id)
+	}
+	gotReplies := map[uint16]replyRecord{}
+	for i := 0; i < 3; i++ {
+		r := <-replyCh
+		id := binary.BigEndian.Uint16(r.resp[:2])
+		gotReplies[id] = r
+	}
+	if r := gotReplies[0x1111]; r.origDst != guaDNS || r.client != client || r.outdev != 27 || r.resp[3]&0x0f != 0 {
+		t.Fatalf("gua tailnet reply: %+v", r)
+	}
+	if r := gotReplies[0x2222]; r.origDst != loopUpstream || r.client != client || r.resp[3]&0x0f != 3 {
+		t.Fatalf("passthrough reply: %+v", r)
+	}
+	if r := gotReplies[0x5555]; r.origDst != llDNS || r.client != llClient || r.outdev != 27 || r.resp[3]&0x0f != 0 {
+		t.Fatalf("link-local reply: %+v", r)
+	}
+
+	// Full concurrency slots must NF_ACCEPT rather than drop or block.
+	for i := 0; i < cap(slots); i++ {
+		slots <- struct{}{}
+	}
+	inCh <- testNFQPacketMsg(1053, 8, 0x300a9, 27, testIPv6UDPPacket(client, guaDNS, testQuery(0x8888, "host.tail1234.ts.net", 28)))
+	v := <-verdictCh
+	if v.id != 8 || v.verdict != nfAccept {
+		t.Fatalf("full slots must NF_ACCEPT: %+v", v)
+	}
+	for i := 0; i < cap(slots); i++ {
+		<-slots
+	}
+
+	cancel()
+	_ = q.Close()
+	if err := <-done; err != nil {
+		t.Fatalf("serveNFQueue exit error: %v", err)
+	}
+}
+
+func TestServeNFQueueExitDoHAndTruncation(t *testing.T) {
+	p, _ := dnsTestProxy(t, func(*http.Request) (int, string) { return 404, "" })
+	p.ipv6Mode = ipv6ModeNFQueue
+	p.mode = "exit-doh"
+	p.exitDoH = "http://100.64.0.2:1234/dns-query"
+	largeResp := append(reply(testQuery(0x0001, "big.example.com", 28), 33, 0), make([]byte, 500)...)
+	p.doh = &http.Client{Transport: transportFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(string(largeResp))), Header: http.Header{}}, nil
+	})}
+	p.ifName = func(idx int) string {
+		if idx == 27 {
+			return "wlan1"
+		}
+		return ""
+	}
+	client := netip.MustParseAddrPort("[fe80::2]:45100")
+	llDNS := netip.MustParseAddrPort("[fe80::1]:53")
+	inCh := make(chan []byte, 4)
+	verdictCh := make(chan uint32, 4)
+	replyCh := make(chan []byte, 4)
+	closedCh := make(chan struct{})
+	var closeOnce sync.Once
+	q := &nfqConn{
+		queue: magicDNSPort,
+		read: func(buf []byte) (int, error) {
+			select {
+			case msg := <-inCh:
+				return copy(buf, msg), nil
+			case <-closedCh:
+				return 0, net.ErrClosed
+			}
+		},
+		write: func(b []byte) (int, error) {
+			if v := nlFind(b[20:], nfqaVerdictHdr); len(v) == 8 {
+				verdictCh <- binary.BigEndian.Uint32(v[:4])
+			}
+			return len(b), nil
+		},
+		close: func() error {
+			closeOnce.Do(func() { close(closedCh) })
+			return nil
+		},
+	}
+	p.reply6 = func(origDst, gotClient netip.AddrPort, outdev uint32, resp []byte) error {
+		if origDst != llDNS || gotClient != client || outdev != 27 {
+			t.Errorf("unexpected reply target: orig=%v client=%v outdev=%d", origDst, gotClient, outdev)
+		}
+		replyCh <- append([]byte(nil), resp...)
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- p.serveNFQueue(ctx, q, make(chan struct{}, 4)) }()
+
+	// Link-local exit-doh query without EDNS must truncate >512B answer and set TC=1.
+	inCh <- testNFQPacketMsg(1053, 10, 0x300a9, 27, testIPv6UDPPacket(client, llDNS, testQuery(0x9999, "big.example.com", 28)))
+	if v := <-verdictCh; v != nfDrop {
+		t.Fatalf("got verdict %d, want nfDrop", v)
+	}
+	resp := <-replyCh
+	if len(resp) > 512 || resp[0] != 0x99 || resp[1] != 0x99 || resp[2]&0x02 == 0 {
+		t.Fatalf("expected truncated TC=1 reply <=512B, got len=%d flags=%x", len(resp), resp[:4])
+	}
+
+	// Link-local exit-passthrough query must supply %wlan1 zone and exact 0x300a9 mark to queryPassthrough.
+	p.mu.Lock()
+	p.mode = "exit-passthrough"
+	p.mu.Unlock()
+	var gotDst netip.AddrPort
+	var gotMark uint32
+	p.forward = func(_ context.Context, dst netip.AddrPort, mark uint32, pkt []byte) ([]byte, error) {
+		gotDst, gotMark = dst, mark
+		return reply(pkt, len(pkt), 0), nil
+	}
+	inCh <- testNFQPacketMsg(1053, 11, 0x300a9, 27, testIPv6UDPPacket(client, llDNS, testQuery(0x7777, "ll.example.com", 28)))
+	if v := <-verdictCh; v != nfDrop {
+		t.Fatalf("got verdict %d, want nfDrop", v)
+	}
+	resp = <-replyCh
+	if gotDst != netip.MustParseAddrPort("[fe80::1%wlan1]:53") || gotMark != 0x300a9 || resp[0] != 0x77 || resp[1] != 0x77 || resp[3]&0x0f != 0 {
+		t.Fatalf("link-local passthrough failed: dst=%v mark=%#x resp=%x", gotDst, gotMark, resp)
+	}
+	cancel()
+	_ = q.Close()
+	if err := <-done; err != nil {
+		t.Fatalf("serveNFQueue exit error: %v", err)
+	}
+}
+
+func TestQueryPassthroughLinkLocalRequiresZone(t *testing.T) {
+	if _, err := queryPassthrough(context.Background(), netip.MustParseAddrPort("[fe80::1]:53"), 0x300a9, testQuery(1, "example.com", 28)); err == nil {
+		t.Fatal("link-local destination without zone must fail")
+	}
+	if got := passthroughMark(0x300a9); got != 0x100300a9 {
+		t.Fatalf("passthroughMark(0x300a9) = %#x, want 0x100300a9", got)
+	}
+}
+
+func TestTransparentUDP6ConcurrentSameOrigDst(t *testing.T) {
+	if err := probeTransparentUDP6(); err != nil {
+		t.Skip("transparent IPv6 socket options unavailable in this environment:", err)
+	}
+	origDst := netip.MustParseAddrPort("[2001:db8:53::1]:15353")
+	const workers = 8
+	fds := make([]int, workers)
+	errs := make(chan error, workers)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			fd, err := openTransparentUDP6()
+			if err != nil {
+				errs <- err
+				return
+			}
+			fds[idx] = fd
+			for _, opt := range [][3]int{
+				{syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1},
+				{syscall.SOL_SOCKET, soReusePort, 1},
+				{syscall.IPPROTO_IPV6, ipv6Transparent, 1},
+				{syscall.SOL_SOCKET, syscall.SO_MARK, 0x10020000},
+			} {
+				v, err := syscall.GetsockoptInt(fd, opt[0], opt[1])
+				if err != nil || v != opt[2] {
+					errs <- errors.New("socket option mismatch before bind")
+					return
+				}
+			}
+			if err := syscall.Bind(fd, &syscall.SockaddrInet6{Port: int(origDst.Port()), Addr: origDst.Addr().As16()}); err != nil {
+				errs <- err
+				return
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for _, fd := range fds {
+		if fd > 0 {
+			_ = syscall.Close(fd)
+		}
+	}
+	for err := range errs {
+		t.Fatalf("concurrent bind to same origDst failed: %v", err)
 	}
 }

@@ -36,30 +36,46 @@ Android 移植将自有 mask 放在 `0x1e000000`，tailscaled 外层传输 socke
 
 ### MagicDNS 机制
 
-代理不读取 Android 的 DNS 服务器配置：本移植中 LocalAPI `dns-osconfig` 始终返回 500（Android 的 OS DNS 管理器不支持读取基础配置），Android 8 起也没有 `net.dns*` 属性。代理逐个查询取回它被 REDIRECT 之前的目的地址（见下文“原目的地址转发”）。
+代理不读取 Android 的 DNS 服务器配置：本移植中 LocalAPI `dns-osconfig` 始终返回 500（Android 的 OS DNS 管理器不支持读取基础配置），Android 8 起也没有 `net.dns*` 属性。代理逐个查询取回原始目的地址与网络标记（见下文“原目的地址转发”与“无 IPv6 NAT 的标准 GKI 内核”）。
 
-内核对象全部归模块所有：
+内核对象全部归模块所有，IPv6 按内核能力分为三级：
 
 - IPv4：`iptables` `nat` 表链 `shellscaled_dns`，由 `OUTPUT -p udp --dport 53 -j shellscaled_dns` 进入。
-- IPv6：`ip6tables` `nat` 表链 `shellscaled_dns`，同样的跳转。Android GKI 内核提供 IPv6 NAT：Pixel（KernelSU）上 `/proc/net/ip6_tables_targets` 含 `REDIRECT` / `DNAT` / `TPROXY`，`ip6tables -t nat -L OUTPUT` 可用。没有 IPv6 NAT 的内核见下文“缺少 IPv6 NAT 的内核”。
-- 服务脚本创建空链和跳转，停止和卸载时删除；代理只对该链执行 `-F` / `-A`，退出时清空。链初始为空，代理未运行时不会拦截任何 DNS。
+- IPv6 一级（内核有 IPv6 NAT）：`ip6tables` `nat` 表链 `shellscaled_dns`，同样的 `OUTPUT` 跳转，使用 `REDIRECT --to-ports 1053`。标准 Android GKI `gki_defconfig`（6.1 / 6.6 / 6.12）默认禁用 `CONFIG_IP6_NF_NAT`（且不启用 `CONFIG_NF_TABLES`），但部分设备或自定义内核（例如部分 Pixel 下游内核）启用了 IPv6 NAT，可用时保留此路径。
+- IPv6 二级（无 IPv6 NAT 的标准 GKI 内核）：`ip6tables` `filter` 表链 `shellscaled_dns`，由 `OUTPUT -p udp --dport 53 -j shellscaled_dns` 进入，使用 `NFQUEUE --queue-num 1053 --queue-bypass`（见下文“无 IPv6 NAT 的标准 GKI 内核”）。支持纯 IPv6 与双栈网络，不依赖 IPv4 DNS，`rules6` 为 true 且无 `ipv6Fallback`。
+- IPv6 三级（既无 IPv6 NAT 也无可用的 `NFQUEUE` / 透明回包能力）：回退到 `ip6tables` `filter` 表链 `shellscaled_dns6_fallback`（见下文“缺少 IPv6 NAT 与 NFQUEUE 的内核”）。
+- 服务脚本创建空链和跳转（启动前清理其他旧层级残留跳转与链），停止和卸载时删除；代理只对当前层级链执行 `-F` / `-A`，退出时清空所有模块 DNS 链。链初始为空，代理未运行时不会拦截任何 DNS。
 
-代理监听 `127.0.0.1:1053` 和 `[::1]:1053` 两个 socket，处理逻辑相同：nat `OUTPUT` 中的 REDIRECT 把本机发出的包改写到该地址族的回环地址。`[::1]` 无法绑定时记录一行日志，IPv6 链保持为空（IPv6 DNS 留在系统路径），`rules6` 为 false。运行中 `[::1]` 的读取出错退出时同样处理：刷新循环清空 IPv6 链，`rules6` 变为 false，直到代理重启。
+在 IPv4 与具备 IPv6 NAT 的设备上，代理监听 `127.0.0.1:1053` 和 `[::1]:1053` 两个 socket，处理逻辑相同：nat `OUTPUT` 中的 REDIRECT 把本机发出的包改写到该地址族的回环地址。`[::1]` 无法绑定时记录一行日志，IPv6 链保持为空（IPv6 DNS 留在系统路径），`rules6` 为 false。运行中 `[::1]` 的读取出错退出时同样处理：刷新循环清空 IPv6 链，`rules6` 变为 false，直到代理重启。
 
-IPv6 必须和 IPv4 一样交给代理：双栈网络上 netd 优先使用 IPv6 DNS 服务器。例如双栈蜂窝网络同时下发 IPv6 和 IPv4 DNS 服务器时，tailnet 名称的 A 与 AAAA 查询都发往 IPv6 服务器，只拦截 IPv4 时这类名称无法解析。
+IPv6 必须和 IPv4 一样交给代理：双栈网络上 netd 优先使用 IPv6 DNS 服务器，纯 IPv6 网络则没有 IPv4 DNS 服务器。例如双栈蜂窝网络同时下发 IPv6 和 IPv4 DNS 服务器时，tailnet 名称的 A 与 AAAA 查询都发往 IPv6 服务器，只拦截 IPv4 时这类名称无法解析。
 
-**缺少 IPv6 NAT 的内核**
+**无 IPv6 NAT 的标准 GKI 内核**
 
-部分内核没有 IPv6 `nat` 表（`ip6tables -t nat -S OUTPUT` 失败），无法把 IPv6 DNS 重定向到 `[::1]:1053`。双栈网络上 netd 优先查询 IPv6 DNS 服务器，tailnet 名称因此超时。
+标准 Android GKI `gki_defconfig`（6.1 / 6.6 / 6.12）没有 `CONFIG_IP6_NF_NAT`（`ip6tables -t nat -S OUTPUT` 失败），无法用 `REDIRECT` 把 IPv6 DNS 改写到 `[::1]:1053`；同时通常内置 `CONFIG_IP6_NF_FILTER=y`、`CONFIG_NETFILTER_XT_TARGET_NFQUEUE=y`、`CONFIG_NETFILTER_NETLINK_QUEUE=y`、`CONFIG_NETFILTER_XT_MATCH_STRING=y` 与 `CONFIG_NETFILTER_XT_MATCH_MARK=y`。
 
-这类内核改用模块自有的 IPv6 `filter` 链 `shellscaled_dns6_fallback`，同样通过一条 UDP/53 OUTPUT 跳转进入，第一条规则同样放行带 bypass 位的查询。被拒绝的查询收到本地 `icmp6-port-unreachable`，Android resolver 随即改问 IPv4 DNS 服务器，再由 IPv4 链交给代理：
+在 Android 15（GKI 6.6.89，SELinux Enforcing）设备上对 `mangle` + `ip -6 rule` + `TPROXY` 与 `filter OUTPUT` + `NFQUEUE` 实测对比后，模块采用 `NFQUEUE` 方案：
+
+- `TPROXY` 方案需要 `mangle OUTPUT/PREROUTING`、独立路由表和 `ip -6 rule`，而 `ip6_route_me_harder` 的 `rt6_need_strict()` 会把 `fe80::/10` 固定到物理接口 `oif`，导致链路本地 DNS 服务器绕过 `TPROXY`；此外厂商 `rate_limit_out` 会将 UID 0（`netd`）的 `ctmark` 覆写为 `0xa`，且代理被 `SIGKILL` 时剩余的 `TPROXY`/策略路由会静默黑洞 DNS。
+- `NFQUEUE` 方案复用 `ip6tables` `filter` 表，不修改 `ip -6 rule`、路由表或 `mangle` 表：链首 `-m mark --mark 0x10000000/0x1e000000 -j RETURN` 放行代理和 `tailscaled` 自有流量，后续规则使用 `-j NFQUEUE --queue-num 1053 --queue-bypass`（`tailnet` 模式带 `--from 60 --to 320` 的 `xt_string` 匹配；`exit-doh` / `exit-passthrough` 接管全部 IPv6 UDP/53）。
+- **崩溃安全**：规则自带 `--queue-bypass` 且队列开启 `NFQA_CFG_F_FAIL_OPEN`；代理停止、崩溃或被 `SIGKILL` 后内核直接放行数据包，队列满或并发槽占满（`NF_ACCEPT`）也不黑洞 DNS。
+- **读取与判决**：代理通过 `NETLINK_NETFILTER`（`NFNL_SUBSYS_QUEUE`）绑定队列 1053，从 `NFQA_PAYLOAD` 提取原始 IPv6 与 UDP 载荷，从 `NFQA_MARK` 直接读取 `skb->mark`（保留 `netd` 的 `0x1ffff` netId 与显式选网位，不受 `ctmark` 覆写影响），从 `NFQA_IFINDEX_OUTDEV` 获取出接口索引。非标准 IPv6/UDP（如带扩展头）、长度不足 12 字节、带 bypass mark、目标为 `[::1]:1053` 或链路本地缺少 `outdev` 的报文直接发 `NF_ACCEPT`；其余查询立即下发 `NF_DROP`（实测对 connected/unconnected `udp6` socket 均不产生 `EPERM` 且 `SO_ERROR == 0`），再异步解析与回包。
+- **链路本地 `fe80::/10`**：由于 `NFQA_IFINDEX_OUTDEV` 给出精确接口索引，所有模式（包括 `exit-doh` 与 `exit-passthrough`）均可拦截 `fe80::/10` DNS 服务器，无需 `-d fe80::/10 -j RETURN`；`exit-passthrough` 转发时以对应接口名作为 IPv6 zone（`[fe80::...%iface]:53`）。
+- **透明伪造回包**：代理为每个应答创建 `AF_INET6` `SOCK_DGRAM` socket，在 `bind` 前设置 `SO_REUSEADDR=1`、`SO_REUSEPORT=1`（`15`，允许 `netd` 并行发起的 A / AAAA 查询同时绑定同一 `[origDst]:53` 而无 `EADDRINUSE`）、`IPV6_TRANSPARENT=1`（`75`）与 `SO_MARK=0x10020000`（绕过 `table 52` 与模块链），`bind` 到原始 `[dns]:53` 并 `sendto` 客户端（地址为链路本地时设置 `sin6_scope_id = outdev`）。
+- **直连转发无需 conntrack**：`NFQUEUE` 直接携带原始目的地址与 `NFQA_MARK`，因此此路径下的 IPv6 `exit-passthrough` 不依赖 IPv6 conntrack，即使 IPv4 conntrack 不可用或网络纯 IPv6（无 IPv4 DNS）也可完整工作。
+
+**缺少 IPv6 NAT 与 NFQUEUE 的内核**
+
+部分非 GKI 内核既没有 IPv6 `nat` 表，也缺少 `NFQUEUE --queue-bypass` / `nfnetlink_queue` / `IPV6_TRANSPARENT`，无法直接拦截并应答 IPv6 DNS。
+
+这类内核回退使用模块自有的 IPv6 `filter` 链 `shellscaled_dns6_fallback`，同样通过一条 UDP/53 OUTPUT 跳转进入，第一条规则同样放行带 bypass 位的查询。被拒绝的查询收到本地 `icmp6-port-unreachable`，Android resolver 随即改问 IPv4 DNS 服务器，再由 IPv4 链交给代理：
 
 - `tailnet`：只拒绝 tailnet 后缀（启用 accept-dns 时也包括 split-DNS 后缀）的查询，普通域名仍走系统路径。tailnet 的 A、AAAA 记录都经 IPv4 入口解析，tailnet IPv6 地址照常可用。
-- `exit-doh` / `exit-passthrough`：拒绝全部 IPv6 UDP/53，所有查询经 IPv4 交给代理，与有 IPv6 NAT 时一样不从物理网络直接查询。
+- `exit-doh` / `exit-passthrough`：拒绝全部 IPv6 UDP/53，所有查询经 IPv4 交给代理，与有 IPv6 NAT / NFQUEUE 时一样不从物理网络直接查询。
 
 该路径要求网络提供可用的 IPv4 DNS 服务器；只提供 IPv6 DNS 的网络不支持。模块不修改 Android DNS 配置、原生 IPv6 地址和路由。停止、断开和卸载时删除该链。状态附加 `ipv6Fallback:true`，WebUI 提示对 IPv4 DNS 的依赖。
 
-代理每 5 秒读取一次 LocalAPI `status` 和 `dns-config`，按模式重建链内容（仅在变化时）。WebUI 应用或关闭出口节点后，helper 向 `magicdns.pid` 中的进程发送 SIGUSR1（先确认 `/proc/<pid>/exe` 与 helper 自身是同一文件，同 `sc_magicdns_running`），代理立即刷新。除 `off` 外，两条链内容基本相同（`xt_string` 偏移不同；整体重定向时 IPv6 链多一条链路本地 RETURN；某一地址族 conntrack 不可用时见下文），第一条总是 `-m mark --mark 0x10000000/0x1e000000 -j RETURN`：代理自己转发的查询带 `SO_MARK=0x10020000`，由此直接返回，不会再次被 REDIRECT；tailscaled 自身带同一 bypass 位的 UDP/53 也不被拦截。第二条 `-j CONNMARK --save-mark --nfmask 0x1ffff --ctmask 0x1ffff` 把 netd 为该查询设置的 netId 与显式选择位存入连接 mark，供原目的地址转发使用。
+代理每 5 秒读取一次 LocalAPI `status` 和 `dns-config`，按模式重建链内容（仅在变化时）。WebUI 应用或关闭出口节点后，helper 向 `magicdns.pid` 中的进程发送 SIGUSR1（先确认 `/proc/<pid>/exe` 与 helper 自身是同一文件，同 `sc_magicdns_running`），代理立即刷新。除 `off` 外，IPv4 与 IPv6 链第一条总是 `-m mark --mark 0x10000000/0x1e000000 -j RETURN`：代理自己转发的查询与伪造回包带 `SO_MARK` 的 `0x10020000` 保护/绕过位，由此直接返回，不会再次被拦截；tailscaled 自身带同一 bypass 位的 UDP/53 也不被拦截。IPv4 与 IPv6 NAT 链第二条 `-j CONNMARK --save-mark --nfmask 0x1ffff --ctmask 0x1ffff` 把 netd 为该查询设置的 netId 与显式选择位存入连接 mark，供原目的地址转发使用；IPv6 NFQUEUE 链无需此规则，直接通过 `NFQA_MARK` 读取 `skb->mark`。
 
 - `off`：MagicDNS 未开启、守护进程不可达或未运行、未选出口节点且没有任何 tailnet 后缀，或未选出口节点且内核没有 `xt_string`；链为空。
 - `tailnet`：对 MagicDNS 后缀，以及 accept-dns 打开时 `dns-config` 的 Routes 后缀（合计最多 16 个；`dns-config` 不论 accept-dns 都返回控制面配置，而 tailscaled 只在 accept-dns 打开时应用 split-DNS，所以默认的 accept-dns=false 下只拦截 MagicDNS 后缀），用 `xt_string` 匹配查询中该后缀的 DNS wire 编码，命中的查询 REDIRECT 到 `127.0.0.1:1053` / `[::1]:1053`。匹配窗口从 QNAME 起点开始：IPv4 为 20（IP）+ 8（UDP）+ 12（DNS 头）= 40，即 `--from 40 --to 300`；IPv6 为 40 + 8 + 12 = 60，即 `--from 60 --to 320`（假设没有扩展头，netd 的 DNS 查询不带扩展头）。窗口长 260 字节，容得下最长 255 字节的 QNAME。其他查询完全不经过代理。
@@ -68,9 +84,9 @@ IPv6 必须和 IPv4 一样交给代理：双栈网络上 netd 优先使用 IPv6 
 
 `tailnet` 模式的 IPv4 规则应用失败，且 `/proc/net/ip_tables_matches` 中没有 `string`（内核没有 `xt_string`）时，未选出口节点的情况下模式为 `off`，不会改为整体接管 UDP/53；状态附加 `noString: true`，WebUI 提示内核缺少 `xt_string`。该判定在代理进程生命周期内保持，不再反复尝试 `xt_string`；其他失败（如 xtables 锁超时）视为暂时性，下次刷新重试。选中出口节点时仍可进入 `exit-doh` / `exit-passthrough`（这两种模式不依赖 `xt_string`）。
 
-`exit-passthrough` 依赖 conntrack 查询。代理在首次需要时分别以 IPv4 和 IPv6 查询一个不存在的连接，返回 ENOENT 的地址族视为可用，两个地址族分别记录。其他错误（SELinux 拒绝、内核无 `CONFIG_NF_CT_NETLINK` 等）记录一行日志，此后该地址族的链不再整体重定向，只装 `tailnet` 的后缀规则（没有 `xt_string` 或没有后缀时为空），另一地址族不受影响；两个地址族都不可用时不再使用该模式：有后缀时用 `tailnet`（没有 `xt_string` 时为 `off`），否则为 `off`。
+`exit-passthrough` 依赖原始目的地址与选网标记恢复。使用 `REDIRECT`（IPv4 及有 IPv6 NAT 的 IPv6）时依赖 conntrack 查询：代理在首次需要时分别以对应地址族查询一个不存在的连接，返回 ENOENT 视为可用，两个地址族分别记录。其他错误（SELinux 拒绝、内核无 `CONFIG_NF_CT_NETLINK` 等）记录一行日志，此后该地址族的链不再整体重定向，只装 `tailnet` 的后缀规则（没有 `xt_string` 或没有后缀时为空），另一地址族不受影响；标准 GKI 上的 IPv6 `NFQUEUE` 路径直接从队列载荷和 `NFQA_MARK` 读取目的地址与 mark，不依赖 IPv6 conntrack；两个地址族都不可用时不再使用该模式：有后缀时用 `tailnet`（没有 `xt_string` 时为 `off`），否则为 `off`。
 
-整体重定向时 IPv6 链在 REDIRECT 之前有一条 `-d fe80::/10 -j RETURN`：conntrack 不含接口作用域，代理无法转发到链路本地服务器（部分路由器经 RA 下发），这类查询留在系统路径。`exit-doh` 下这些查询因此不走 DoH。
+整体重定向时，IPv6 NAT 链在 REDIRECT 之前有一条 `-d fe80::/10 -j RETURN`：conntrack 不含接口作用域，代理无法转发到链路本地服务器（部分路由器经 RA 下发），这类查询留在系统路径（`exit-doh` 下这些查询因此不走 DoH）。IPv6 `NFQUEUE` 链通过 `NFQA_IFINDEX_OUTDEV` 获取出接口索引，不在规则中排除 `fe80::/10`。
 
 代理应答规则：
 
@@ -84,7 +100,7 @@ IPv6 必须和 IPv4 一样交给代理：双栈网络上 netd 优先使用 IPv6 
 
 REDIRECT 改写了包头，`IP_RECVORIGDSTADDR` / `IP_ORIGDSTADDR` 报告的是改写后的 `127.0.0.1:1053`（它为 TPROXY 设计），UDP 也没有 `SO_ORIGINAL_DST`。代理因此用 conntrack netlink（`NETLINK_NETFILTER`，`IPCTNL_MSG_CT_GET`）按回复方向元组 `127.0.0.1:1053 → 客户端地址:端口` 查询连接（IPv6 监听上收到的查询用 `nfgenmsg` 族 `AF_INET6`、`CTA_IP_V6_SRC` / `CTA_IP_V6_DST` 和 `[::1]:1053`），取原方向元组的目的地址（`CTA_IP_V4_DST` 或 `CTA_IP_V6_DST`）和端口，以及连接 mark（`CTA_MARK`）。查不到或结果仍是回环地址的 1053 端口时回 SERVFAIL。
 
-转发使用与原目的地址同族的新 UDP socket（`udp4` / `udp6`），`SO_MARK=0x10020000 | (连接 mark & 0x1ffff)`（`SOL_SOCKET` 选项，与地址族无关）：bypass 位与受保护位同 tailscaled 外层 socket，低 17 位是链中 CONNMARK 保存的 netd netId 与显式选择位。带 bypass 位的包跳过 12500 / 13001 与 table 52，再由 Android 显式网络规则（16000）按 netd 为该查询选择的网络出网（例如正在验证的 Wi-Fi），没有 netId 时按默认网络；源地址在 connect 时按该路由选择；两族 nat OUTPUT 中链首的 mark RETURN 规则使它不再进入代理。netd 原本的 DNS socket 带显式选择位和 `protectedFromVpn` 位，不被 13001 捕获（见“Android 策略路由”）；REDIRECT 在 nat `OUTPUT` 完成，与路由规则无关，所以代理仍能收到这些查询。
+转发使用与原目的地址同族的新 UDP socket（`udp4` / `udp6`），`SO_MARK=0x10020000 | (mark & 0x1ffff)`（`SOL_SOCKET` 选项，与地址族无关）：bypass 位与受保护位同 tailscaled 外层 socket，低 17 位是来自链中 CONNMARK（REDIRECT）或 `NFQA_MARK`（IPv6 `NFQUEUE`）的 netd netId 与显式选择位。带 bypass 位的包跳过 12500 / 13001 与 table 52，再由 Android 显式网络规则（16000）按 netd 为该查询选择的网络出网（例如正在验证的 Wi-Fi），没有 netId 时按默认网络；源地址在 connect 时按该路由选择；两族模块链首的 mark RETURN 规则使它不再进入代理。netd 原本的 DNS socket 带显式选择位和 `protectedFromVpn` 位，不被 13001 捕获（见“Android 策略路由”）；REDIRECT 在 nat `OUTPUT` 完成，IPv6 `NFQUEUE` 在 filter `OUTPUT` 完成，均与策略路由无关，所以代理仍能收到这些查询。
 
 出口节点下没有 DoH 时，普通 DNS 因此从物理接口直接发往局域网或运营商解析器，不经出口节点。这是有意的：官方 Tailscale Android App 在同样情况下由 tailscaled 经 `VpnService.protect` 保护的 socket 转发到系统解析器，行为等价。代价是这些 DNS 查询对本地网络可见，解析结果按本地网络而非出口节点所在地给出。
 
@@ -96,7 +112,7 @@ REDIRECT 改写了包头，`IP_RECVORIGDSTADDR` / `IP_ORIGDSTADDR` 报告的是�
 {"updated":<unix 秒>,"mode":"off|tailnet|exit-doh|exit-passthrough","enabled":true,"noString":false,"rules":true,"rules6":true,"privateDns":"off|opportunistic|hostname|unknown","upstream":"system|exit-node|passthrough","daemon":"<BackendState>","exitNode":"<prefs.ExitNodeID>"}
 ```
 
-`upstream` 为 `system`（`off` / `tailnet`，普通名称不经代理）、`exit-node`（`exit-doh`）或 `passthrough`（`exit-passthrough`，按原目的地址转发）。`enabled` 是本次刷新时开关文件是否存在，`noString` 表示内核没有 `xt_string`。`rules` / `rules6` 表示 IPv4 / IPv6 nat 链内容是否按期望应用（`rules6` 在 `[::1]:1053` 无法监听或监听已停止时为 false；任一为 false 且模式不是 `off` 时，WebUI 显示 MagicDNS 规则未生效）；`-F` 或任一 `-A` 失败时该链被清空，DNS 留在系统路径而不会被黑洞，错误按不同内容各记一行到 `daemon.log`，每次刷新重试直到成功。`privateDns` 每 30 秒用只读的 `cmd settings get global private_dns_mode` 读取。`daemon` / `exitNode` 记录本次决定所依据的 BackendState（LocalAPI 失败时为空）和 prefs 中的出口节点 ID（未选择或未 Running 时为空）；除此之外文件不含后缀、查询名、PeerAPI 地址或解析器地址。RPC `status` 响应的 `magicDNS` 字段转发这些值，并以 `updated` 在 20 秒内作为 `running`；`running` 时若 `enabled` 与当前开关不同、`daemon` 与当前 BackendState 不同，或 Running 时 `exitNode` 与当前 prefs 不同，则附加 `pending: true`，WebUI 显示“MagicDNS 正在更新…”并在 2 秒后重新拉取状态，而不是显示旧模式。连接 / 断开和切换出口节点后 helper 都会用 SIGUSR1 让代理立即刷新。
+`upstream` 为 `system`（`off` / `tailnet`，普通名称不经代理）、`exit-node`（`exit-doh`）或 `passthrough`（`exit-passthrough`，按原目的地址转发）。`enabled` 是本次刷新时开关文件是否存在，`noString` 表示内核没有 `xt_string`。`rules` / `rules6` 表示 IPv4 / IPv6 当前层级模块链内容是否按期望应用（`rules6` 在 `[::1]:1053` 或 `NFQUEUE` 队列监听无法启动或已停止时为 false；任一为 false 且模式不是 `off` 时，WebUI 显示 MagicDNS 规则未生效）；`-F` 或任一 `-A` 失败时该链被清空，DNS 留在系统路径而不会被黑洞，错误按不同内容各记一行到 `daemon.log`，每次刷新重试直到成功。`privateDns` 每 30 秒用只读的 `cmd settings get global private_dns_mode` 读取。`daemon` / `exitNode` 记录本次决定所依据的 BackendState（LocalAPI 失败时为空）和 prefs 中的出口节点 ID（未选择或未 Running 时为空）；除此之外文件不含后缀、查询名、PeerAPI 地址或解析器地址。RPC `status` 响应的 `magicDNS` 字段转发这些值，并以 `updated` 在 20 秒内作为 `running`；`running` 时若 `enabled` 与当前开关不同、`daemon` 与当前 BackendState 不同，或 Running 时 `exitNode` 与当前 prefs 不同，则附加 `pending: true`，WebUI 显示“MagicDNS 正在更新…”并在 2 秒后重新拉取状态，而不是显示旧模式。连接 / 断开和切换出口节点后 helper 都会用 SIGUSR1 让代理立即刷新。
 
 ### 限制
 
@@ -105,18 +121,18 @@ REDIRECT 改写了包头，`IP_RECVORIGDSTADDR` / `IP_ORIGDSTADDR` 报告的是�
 - 不解析短名称（只解析完整 FQDN）。
 - 不拦截 TCP/53 查询。
 - 开启 MagicDNS 之前刚查询失败的 tailnet 名称，开启后仍会失败几分钟：Android 的 DNS resolver 缓存了否定应答，模块无法清除该缓存（`ndc resolver flushnet` 在新版 Android 上已不可用）。两台实机上缓存都在数分钟内过期。
-- IPv6 nat 链应用失败（`rules6` 为 false，例如内核缺少 IPv6 NAT）时，IPv6 DNS 留在系统路径：tailnet 名称在 IPv6 优先的网络上失败；出口节点下 IPv6 DNS 进入隧道，通常不可达。
-- 发往 IPv6 链路本地 DNS 服务器（`fe80::/10`）的 tailnet 名称查询只在 `tailnet` 模式下被拦截；整体重定向的模式中这类查询留在系统路径。
+- IPv6 拦截初始化失败（`rules6` 为 false，例如 `[::1]:1053` 绑定失败或队列中断）时，IPv6 DNS 留在系统路径：tailnet 名称在 IPv6 优先的网络上失败；出口节点下 IPv6 DNS 进入隧道，通常不可达。只有当内核既无 IPv6 NAT 也无 `NFQUEUE` 拦截能力时，才启用 `ipv6Fallback` 并依赖 IPv4 DNS。
+- 发往 IPv6 链路本地 DNS 服务器（`fe80::/10`）的普通 DNS 查询：在 IPv6 `NFQUEUE` 模式下可拦截（使用 `NFQA_IFINDEX_OUTDEV` 保持作用域）；在 IPv6 NAT 模式下仅 `tailnet` 模式拦截，整体重定向模式中留在系统路径。
 - 系统解析器若本身是 `100.x` 地址，带 bypass mark 的转发无法进入隧道。其他 VPN App 的解析器经显式规则路由，是否可达取决于该 VPN 对 root 与受保护 socket 的 UID 规则。
 - WebUI 之外（命令行、其他客户端）改变出口节点时，在下一次刷新（5 秒内）生效。
-- `xt_string`、`xt_mark`、conntrack netlink 查询（SELinux 与内核 `CONFIG_NF_CT_NETLINK`，IPv4 与 IPv6）、IPv4 / IPv6 REDIRECT 回包路径（`[::1]` 应答经 conntrack 还原为原服务器地址）和各厂商 `nat OUTPUT` 中先于本模块跳转的终止规则都需要在设备上确认。
+- `xt_string`、`xt_mark`、conntrack netlink 查询（SELinux 与内核 `CONFIG_NF_CT_NETLINK`）、`NFQUEUE` / `IPV6_TRANSPARENT` 回包路径（含 `SO_REUSEPORT` 并发绑定同一 `[origDst]:53` 与 `fe80::/10` 作用域）、IPv4 / IPv6 REDIRECT 回包路径，以及各厂商 `OUTPUT` 中先于本模块跳转的终止规则与 `ctmark` 覆写规则都需要在设备上确认。
 
 ### 设备验收清单
 
-- `iptables -t nat -S shellscaled_dns` 和 `ip6tables -t nat -S shellscaled_dns`
-- `ip6tables -t nat -L shellscaled_dns -n -v` 在 IPv6 优先的网络上解析 tailnet 名称后，后缀规则的计数增加
-- `ss -ulpn | grep 1053`（或 `netstat -ulpn`）同时有 `127.0.0.1:1053` 和 `[::1]:1053`
-- `cat /data/adb/shellscaled/run/magicdns.json`
+- `iptables -t nat -S shellscaled_dns` 和（按内核层级）`ip6tables -t nat -S shellscaled_dns` 或 `ip6tables -t filter -S shellscaled_dns`
+- `ip6tables -t nat -L shellscaled_dns -n -v` 或 `ip6tables -t filter -L shellscaled_dns -n -v` 在 IPv6 优先或纯 IPv6 网络上解析 tailnet 名称后，后缀规则的计数增加
+- `ss -ulpn | grep 1053`（或 `netstat -ulpn`）显示 `127.0.0.1:1053`，IPv6 侧为 `[::1]:1053`（NAT）或 `/proc/net/netfilter/nfnetlink_queue` 显示队列 `1053`（NFQUEUE）
+- `cat /data/adb/shellscaled/run/magicdns.json`（GKI NFQUEUE 路径下 `rules6: true` 且无 `ipv6Fallback: true`）
 - `cmd settings get global private_dns_mode`
 - `ping -c1 <host>.<suffix>`
 - 结束代理进程后普通网页仍可访问

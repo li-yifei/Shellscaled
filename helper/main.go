@@ -1774,6 +1774,18 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) == 2 && os.Args[1] == "magicdns-probe-v6" {
+		if err := probeIPv6NFQueueRuntime(); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) == 2 && os.Args[1] == "magicdns-probe-v6-socket" {
+		if err := probeTransparentUDP6(); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) == 2 && os.Args[1] == "taildrop-auto" {
 		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 		defer stop()

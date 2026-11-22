@@ -98,12 +98,21 @@ func TestMagicDNSDisabledDuringDoHProbeDiscardsOldPlan(t *testing.T) {
 }
 
 func TestMagicDNSFailedDisableRemainsPendingUntilRetry(t *testing.T) {
-	for _, fallback := range []bool{false, true} {
-		t.Run(map[bool]string{false: "IPv4", true: "IPv6-filter-fallback"}[fallback], func(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		v6Mode   int
+		fallback bool
+	}{
+		{"IPv4", ipv6ModeNAT, false},
+		{"IPv6-filter-nfqueue", ipv6ModeNFQueue, false},
+		{"IPv6-filter-fallback", ipv6ModeFallback, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			p := dnsControlProxy(t)
-			p.ipv6Fallback = fallback
+			p.ipv6Mode = tc.v6Mode
+			p.ipv6Fallback = tc.fallback
 			failedBinary := "/system/bin/iptables"
-			if fallback {
+			if tc.v6Mode != ipv6ModeNAT {
 				failedBinary = "/system/bin/ip6tables"
 			}
 			failFlush := false

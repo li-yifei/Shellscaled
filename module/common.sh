@@ -219,25 +219,64 @@ sc_magicdns_running() {
 }
 
 # Module-owned DNS chains and OUTPUT jumps; the proxy fills their contents.
+sc_magicdns_remove_v6_tier() {
+    while /system/bin/ip6tables -w -t "$1" -D OUTPUT -p udp --dport 53 -j "$2" 2>/dev/null; do :; done
+    /system/bin/ip6tables -w -t "$1" -F "$2" 2>/dev/null
+    /system/bin/ip6tables -w -t "$1" -X "$2" 2>/dev/null
+}
+
+sc_magicdns_v6_nfqueue_target() {
+    [ -e /proc/net/netfilter/nfnetlink_queue ] || return 1
+    if /system/bin/ip6tables -w -t filter -S shellscaled_dns >/dev/null 2>&1; then
+        grep -Fxq NFQUEUE /proc/net/ip6_tables_targets 2>/dev/null && return 0
+    fi
+    /system/bin/ip6tables -w -t filter -N shellscaled_dns_probe 2>/dev/null ||
+        /system/bin/ip6tables -w -t filter -F shellscaled_dns_probe 2>/dev/null || return 1
+    if /system/bin/ip6tables -w -t filter -A shellscaled_dns_probe -p udp -j NFQUEUE --queue-num 1053 --queue-bypass 2>/dev/null; then
+        /system/bin/ip6tables -w -t filter -F shellscaled_dns_probe 2>/dev/null
+        /system/bin/ip6tables -w -t filter -X shellscaled_dns_probe 2>/dev/null
+        return 0
+    fi
+    /system/bin/ip6tables -w -t filter -F shellscaled_dns_probe 2>/dev/null
+    /system/bin/ip6tables -w -t filter -X shellscaled_dns_probe 2>/dev/null
+    return 1
+}
+
+sc_magicdns_v6_nfqueue_capable() {
+    sc_magicdns_v6_nfqueue_target || return 1
+    if [ -x "$SC_MODDIR/bin/shellscaled-web" ]; then
+        "$SC_MODDIR/bin/shellscaled-web" magicdns-probe-v6-socket >/dev/null 2>&1 || return 1
+    fi
+    return 0
+}
+
 sc_magicdns_rules_remove() {
     while /system/bin/iptables -w -t nat -D OUTPUT -p udp --dport 53 -j shellscaled_dns 2>/dev/null; do :; done
     /system/bin/iptables -w -t nat -F shellscaled_dns 2>/dev/null
     /system/bin/iptables -w -t nat -X shellscaled_dns 2>/dev/null
-    while /system/bin/ip6tables -w -t nat -D OUTPUT -p udp --dport 53 -j shellscaled_dns 2>/dev/null; do :; done
-    /system/bin/ip6tables -w -t nat -F shellscaled_dns 2>/dev/null
-    /system/bin/ip6tables -w -t nat -X shellscaled_dns 2>/dev/null
-    while /system/bin/ip6tables -w -t filter -D OUTPUT -p udp --dport 53 -j shellscaled_dns6_fallback 2>/dev/null; do :; done
-    /system/bin/ip6tables -w -t filter -F shellscaled_dns6_fallback 2>/dev/null
-    /system/bin/ip6tables -w -t filter -X shellscaled_dns6_fallback 2>/dev/null
+    sc_magicdns_remove_v6_tier nat shellscaled_dns
+    sc_magicdns_remove_v6_tier filter shellscaled_dns
+    sc_magicdns_remove_v6_tier filter shellscaled_dns6_fallback
+    /system/bin/ip6tables -w -t filter -F shellscaled_dns_probe 2>/dev/null
+    /system/bin/ip6tables -w -t filter -X shellscaled_dns_probe 2>/dev/null
     return 0
 }
 
 sc_magicdns_jumps() {
     /system/bin/iptables -w -t nat -C OUTPUT -p udp --dport 53 -j shellscaled_dns 2>/dev/null || return 1
     if /system/bin/ip6tables -w -t nat -S OUTPUT >/dev/null 2>&1; then
-        /system/bin/ip6tables -w -t nat -C OUTPUT -p udp --dport 53 -j shellscaled_dns 2>/dev/null
+        /system/bin/ip6tables -w -t nat -C OUTPUT -p udp --dport 53 -j shellscaled_dns 2>/dev/null || return 1
+        /system/bin/ip6tables -w -t filter -C OUTPUT -p udp --dport 53 -j shellscaled_dns 2>/dev/null && return 1
+        /system/bin/ip6tables -w -t filter -C OUTPUT -p udp --dport 53 -j shellscaled_dns6_fallback 2>/dev/null && return 1
+        return 0
+    elif sc_magicdns_v6_nfqueue_capable; then
+        /system/bin/ip6tables -w -t filter -C OUTPUT -p udp --dport 53 -j shellscaled_dns 2>/dev/null || return 1
+        /system/bin/ip6tables -w -t filter -C OUTPUT -p udp --dport 53 -j shellscaled_dns6_fallback 2>/dev/null && return 1
+        return 0
     else
-        /system/bin/ip6tables -w -t filter -C OUTPUT -p udp --dport 53 -j shellscaled_dns6_fallback 2>/dev/null
+        /system/bin/ip6tables -w -t filter -C OUTPUT -p udp --dport 53 -j shellscaled_dns6_fallback 2>/dev/null || return 1
+        /system/bin/ip6tables -w -t filter -C OUTPUT -p udp --dport 53 -j shellscaled_dns 2>/dev/null && return 1
+        return 0
     fi
 }
 
@@ -251,9 +290,18 @@ sc_magicdns_start() {
     /system/bin/iptables -w -t nat -C OUTPUT -p udp --dport 53 -j shellscaled_dns 2>/dev/null ||
         /system/bin/iptables -w -t nat -A OUTPUT -p udp --dport 53 -j shellscaled_dns 2>/dev/null
     if /system/bin/ip6tables -w -t nat -S OUTPUT >/dev/null 2>&1; then
+        sc_magicdns_remove_v6_tier filter shellscaled_dns
+        sc_magicdns_remove_v6_tier filter shellscaled_dns6_fallback
         sc_dns6_table=nat
         sc_dns6_chain=shellscaled_dns
+    elif "$SC_MODDIR/bin/shellscaled-web" magicdns-probe-v6 >/dev/null 2>&1 && sc_magicdns_v6_nfqueue_target; then
+        sc_magicdns_remove_v6_tier nat shellscaled_dns
+        sc_magicdns_remove_v6_tier filter shellscaled_dns6_fallback
+        sc_dns6_table=filter
+        sc_dns6_chain=shellscaled_dns
     else
+        sc_magicdns_remove_v6_tier nat shellscaled_dns
+        sc_magicdns_remove_v6_tier filter shellscaled_dns
         sc_dns6_table=filter
         sc_dns6_chain=shellscaled_dns6_fallback
     fi
